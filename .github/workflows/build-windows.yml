@@ -24,7 +24,7 @@ jobs:
 
     - name: Build with PyInstaller
       run: |
-        pyinstaller Prophet_MP_Filter_Tool.spec
+        pyinstaller --clean --upx-dir=upx-4.2.4-win64 Prophet_MP_Filter_Tool.spec
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
