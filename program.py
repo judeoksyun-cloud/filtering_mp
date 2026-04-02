@@ -2,9 +2,6 @@ import sys
 import os
 import io
 import re
-import csv
-import collections
-import random
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, 
@@ -23,13 +20,16 @@ class DataLoaderThread(QThread):
         
     def run(self):
         try:
-            result_data = {} # {filepath: (headers, data_rows, meta_lines)}
+            import pandas as pd
+            import csv
+            
+            result_data = {} # {filepath: (df, meta_lines)}
             total_files = len(self.file_paths)
             
             for file_idx, file_path in enumerate(self.file_paths):
                 # 1. Read metadata
                 with open(file_path, 'r', encoding='cp949', errors='replace') as f:
-                    lines = [line.replace('\0', '') for line in f]
+                    lines = f.readlines()
                 
                 meta_data_lines = []
                 data_start_idx = 0
@@ -47,29 +47,28 @@ class DataLoaderThread(QThread):
                             total_lines_for_file = int(match.group())
                         break
                 
-                data_rows = []
-                headers = []
+                chunksize = 100000
+                chunks = []
+                rows_read = 0
                 
-                with open(file_path, 'r', encoding='cp949', errors='replace', newline='') as f:
-                    cleaned_file = (line.replace('\0', '') for line in f)
-                    for _ in range(data_start_idx):
-                        next(cleaned_file, None)
+                with pd.read_csv(file_path, skiprows=data_start_idx, low_memory=False, 
+                                 encoding='cp949', encoding_errors='replace', dtype=str, quoting=csv.QUOTE_NONE, chunksize=chunksize) as reader:
+                    for chunk in reader:
+                        chunks.append(chunk)
+                        rows_read += len(chunk)
                         
-                    reader = csv.reader(cleaned_file, quoting=csv.QUOTE_NONE)
-                    try:
-                        headers = next(reader)
-                    except StopIteration:
-                        pass
-                        
-                    for i, row in enumerate(reader):
-                        data_rows.append(row)
-                        if i % 100000 == 0:
-                            base_prog = (file_idx / total_files) * 100
-                            file_prog = (min(int((i / total_lines_for_file) * 100), 100) / total_files)
-                            prog = int(base_prog + file_prog)
-                            self.progress.emit(prog)
-                            
-                result_data[file_path] = (headers, data_rows, meta_data_lines)
+                        base_prog = (file_idx / total_files) * 100
+                        file_prog = (min(int((rows_read / total_lines_for_file) * 100), 100) / total_files)
+                        prog = int(base_prog + file_prog)
+                        self.progress.emit(prog)
+                
+                if chunks:
+                    df = pd.concat(chunks, ignore_index=True)
+                else:
+                    df = pd.DataFrame()
+                    
+                df.fillna("", inplace=True)
+                result_data[file_path] = (df, meta_data_lines)
             
             self.finished.emit(result_data)
             
@@ -92,133 +91,102 @@ class DataFilterThread(QThread):
 
     def run(self):
         try:
+            import pandas as pd
+            import csv
+            
             total_files = len(self.raw_data_dict)
             file_idx = 0
             
             # Merge filters
-            merged_filters = collections.defaultdict(set)
+            merged_filters = {}
             for col, vals in self.filter_criteria:
+                if col not in merged_filters:
+                    merged_filters[col] = set()
                 merged_filters[col].update(vals)
 
             total_filtered_rows = 0
 
-            for file_path, (headers, raw_data_rows, meta_lines) in self.raw_data_dict.items():
-                filtered_rows = list(raw_data_rows)
-                primary_filter_indices = {}
+            for file_path, (raw_df, meta_lines) in self.raw_data_dict.items():
+                df_filtered = raw_df.copy()
                 
                 # Apply Filtering
+                primary_filter_cols = []
                 if merged_filters:
                     for col, vals in merged_filters.items():
-                        final_idx = None
-                        if col in headers:
-                            final_idx = headers.index(col)
+                        vals_list = list(vals)
+                        
+                        final_col = None
+                        if col in df_filtered.columns:
+                            final_col = col
                         else:
-                            for i, h in enumerate(headers):
-                                if h.strip().lstrip('!').lower() == col.strip().lstrip('!').lower():
-                                    final_idx = i
+                            for df_col in df_filtered.columns:
+                                c_df = df_col.strip().lstrip('!')
+                                c_in = col.strip().lstrip('!')
+                                if c_df.lower() == c_in.lower():
+                                    final_col = df_col
                                     break
-                                    
-                        if final_idx is not None:
-                            vals_set = {str(v).strip().strip('\'"') for v in vals}
-                            primary_filter_indices[final_idx] = vals_set
+                        
+                        if not final_col:
+                            continue
                             
-                    if primary_filter_indices:
-                        new_filtered = []
-                        for row in filtered_rows:
-                            match = True
-                            for idx, vals_set in primary_filter_indices.items():
-                                if idx < len(row):
-                                    val = row[idx].strip().strip('\'"')
-                                    if val not in vals_set:
-                                        match = False
-                                        break
-                                else:
-                                    match = False
-                                    break
-                            if match:
-                                new_filtered.append(row)
-                        filtered_rows = new_filtered
+                        primary_filter_cols.append(final_col)
+                        series_str = df_filtered[final_col].str.strip().str.strip('\'"')
+                        vals_clean = [str(v).strip().strip('\'"') for v in vals_list]
+                        df_filtered = df_filtered[series_str.isin(vals_clean)]
 
                 # Random Sampling (Stage 2)
-                if self.mode == 'random' and filtered_rows:
-                    sample_filter_indices = {}
-                    merged_sample_filters = collections.defaultdict(set)
+                if self.mode == 'random' and not df_filtered.empty:
+                    merged_sample_filters = {}
                     if self.sample_filters:
                         for col, vals in self.sample_filters:
+                            if col not in merged_sample_filters:
+                                merged_sample_filters[col] = set()
                             merged_sample_filters[col].update(vals)
-                            
-                    target_group_indices = list(primary_filter_indices.keys())
+                    
+                    target_cols_for_grouping = list(primary_filter_cols)
                     
                     if merged_sample_filters:
                         for col, vals in merged_sample_filters.items():
-                            final_idx = None
-                            if col in headers:
-                                final_idx = headers.index(col)
+                            vals_list = list(vals)
+                            final_col = None
+                            if col in df_filtered.columns:
+                                final_col = col
                             else:
-                                for i, h in enumerate(headers):
-                                    if h.strip().lstrip('!').lower() == col.strip().lstrip('!').lower():
-                                        final_idx = i
+                                for df_col in df_filtered.columns:
+                                    if df_col.strip().lstrip('!').lower() == col.strip().lstrip('!').lower():
+                                        final_col = df_col
                                         break
-                                        
-                            if final_idx is not None:
-                                vals_set = {str(v).strip().strip('\'"') for v in vals}
-                                sample_filter_indices[final_idx] = vals_set
-                                if final_idx not in target_group_indices:
-                                    target_group_indices.append(final_idx)
-                                    
-                        if sample_filter_indices:
-                            new_filtered = []
-                            for row in filtered_rows:
-                                match = True
-                                for idx, vals_set in sample_filter_indices.items():
-                                    if idx < len(row):
-                                        val = row[idx].strip().strip('\'"')
-                                        if val not in vals_set:
-                                            match = False
-                                            break
-                                    else:
-                                        match = False
-                                        break
-                                if match:
-                                    new_filtered.append(row)
-                            filtered_rows = new_filtered
                             
-                    if target_group_indices and filtered_rows:
-                        groups = collections.defaultdict(list)
-                        for row in filtered_rows:
-                            key = tuple(row[idx].strip().strip('\'"') if idx < len(row) else "" for idx in target_group_indices)
-                            groups[key].append(row)
-                            
-                        sampled_rows = []
-                        for key, group in groups.items():
-                            k = min(len(group), self.sample_n)
-                            sampled_rows.extend(random.sample(group, k))
-                            
-                        filtered_rows = sampled_rows
-
+                            if not final_col:
+                                continue
+                                
+                            if final_col not in target_cols_for_grouping:
+                                target_cols_for_grouping.append(final_col)
+                            series_str = df_filtered[final_col].str.strip().str.strip('\'"')
+                            vals_clean = [str(v).strip().strip('\'"') for v in vals_list]
+                            df_filtered = df_filtered[series_str.isin(vals_clean)]
+                    
+                    if target_cols_for_grouping and not df_filtered.empty:
+                        sampled_dfs = []
+                        for name, group in df_filtered.groupby(target_cols_for_grouping):
+                            sampled_dfs.append(group.sample(n=min(len(group), self.sample_n)))
+                        if sampled_dfs:
+                            df_filtered = pd.concat(sampled_dfs, ignore_index=True)
+                        else:
+                            df_filtered = pd.DataFrame(columns=df_filtered.columns)
+                    
                     # Assign Sequential SPCODE
-                    if filtered_rows:
-                        spcode_idx = None
-                        if 'SPCODE' in headers:
-                            spcode_idx = headers.index('SPCODE')
-                        elif '"SPCODE"' in headers:
-                            spcode_idx = headers.index('"SPCODE"')
-                            
-                        if spcode_idx is not None:
-                            for idx_enum, row in enumerate(filtered_rows):
-                                new_spcode = str(1001 + idx_enum)
-                                if spcode_idx < len(row):
-                                    row[spcode_idx] = new_spcode
-                                else:
-                                    row.extend([''] * (spcode_idx - len(row) + 1))
-                                    row[spcode_idx] = new_spcode
+                    if not df_filtered.empty:
+                        spcode_col = 'SPCODE' if 'SPCODE' in df_filtered.columns else '"SPCODE"' if '"SPCODE"' in df_filtered.columns else None
+                        if spcode_col:
+                            new_spcodes = [str(x) for x in range(1001, 1001 + len(df_filtered))]
+                            df_filtered[spcode_col] = new_spcodes
 
                 # Calculate rows starting with '*'
+                first_col = df_filtered.columns[0] if not df_filtered.empty else None
                 star_count = 0
-                if filtered_rows:
-                    for row in filtered_rows:
-                        if len(row) > 0 and row[0].strip().startswith('*'):
-                            star_count += 1
+                if first_col and not df_filtered.empty:
+                    star_count = int(df_filtered[first_col].astype(str).str.strip().str.startswith('*').sum())
 
                 # Save new file
                 dir_name = os.path.dirname(file_path)
@@ -235,13 +203,11 @@ class DataFilterThread(QThread):
                     
                 with open(save_name, 'w', encoding='cp949', errors='replace', newline='\r\n') as f:
                     f.writelines(updated_meta)
-                    writer = csv.writer(f, quoting=csv.QUOTE_NONE, escapechar='\\')
-                    if headers:
-                        writer.writerow(headers)
-                    if filtered_rows:
-                        writer.writerows(filtered_rows)
                 
-                total_filtered_rows += len(filtered_rows)
+                if not df_filtered.empty:
+                    df_filtered.to_csv(save_name, mode='a', index=False, encoding='cp949', errors='replace', lineterminator='\r\n', quoting=csv.QUOTE_NONE)
+                
+                total_filtered_rows += len(df_filtered)
                 
                 file_idx += 1
                 prog = int((file_idx / total_files) * 100)
@@ -250,6 +216,7 @@ class DataFilterThread(QThread):
             self.finished.emit(f"필터링 완료!\n총 저장된 파일 개수: {total_files}개\n추출된 총 행 수: {total_filtered_rows}행\n저장 위치: {new_dir}")
         except Exception as e:
             self.error.emit(str(e))
+
 
 class SamplingDialog(QDialog):
     def __init__(self, parent=None):
@@ -344,7 +311,7 @@ class SamplingDialog(QDialog):
 class DataFilterApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.raw_data_dict = {} # {filepath: (headers, data_rows, meta_lines)}
+        self.raw_data_dict = {} # {filepath: (df, meta_lines)}
         self.initUI()
 
     def resource_path(self, relative_path):
@@ -396,7 +363,6 @@ class DataFilterApp(QMainWindow):
         btn_run = QPushButton("필터링 적용 및 저장하기")
         btn_run.setStyleSheet("background-color: #0078d7; color: white; font-size: 14px; padding: 10px;")
         btn_run.clicked.connect(self.show_run_options)
-        
         main_layout.addWidget(btn_run)
 
     def show_run_options(self):
@@ -413,16 +379,16 @@ class DataFilterApp(QMainWindow):
         msg_box.addButton("취소", QMessageBox.RejectRole)
         
         msg_box.exec_()
-            
+        
         if msg_box.clickedButton() == btn_all:
-            output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
+            output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
             if ok and output_dir.strip():
                 self.run_filtering(mode='all', output_dir=output_dir.strip())
         elif msg_box.clickedButton() == btn_random:
             dialog = SamplingDialog(self)
             if dialog.exec_():
                 sample_filters, sample_n = dialog.get_data()
-                output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
+                output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
                 if ok and output_dir.strip():
                     self.run_filtering(mode='random', sample_n=sample_n, sample_filters=sample_filters, output_dir=output_dir.strip())
 
@@ -478,11 +444,12 @@ class DataFilterApp(QMainWindow):
             
         total_rows = 0
         total_star_rows = 0
-        for filepath, (headers, data_rows, meta) in self.raw_data_dict.items():
-            total_rows += len(data_rows)
-            for row in data_rows:
-                if len(row) > 0 and row[0].strip().startswith('*'):
-                    total_star_rows += 1
+        for filepath, (df, meta) in self.raw_data_dict.items():
+            total_rows += len(df)
+            first_col = df.columns[0] if not df.empty else None
+            if first_col and not df.empty:
+                star_count = int(df[first_col].astype(str).str.strip().str.startswith('*').sum())
+                total_star_rows += star_count
         
         self.lbl_status.setText(f"파일 {len(self.raw_data_dict)}개 로드 완료 (전체: {total_star_rows}행)")
         self.lbl_status.setStyleSheet("color: green; font-weight: bold;")
