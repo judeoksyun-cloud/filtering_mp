@@ -29,7 +29,7 @@ class DataLoaderThread(QThread):
             for file_idx, file_path in enumerate(self.file_paths):
                 # 1. Read metadata
                 with open(file_path, 'r', encoding='cp949', errors='replace') as f:
-                    lines = f.readlines()
+                    lines = [line.replace('\0', '') for line in f]
                 
                 meta_data_lines = []
                 data_start_idx = 0
@@ -51,10 +51,11 @@ class DataLoaderThread(QThread):
                 headers = []
                 
                 with open(file_path, 'r', encoding='cp949', errors='replace', newline='') as f:
+                    cleaned_file = (line.replace('\0', '') for line in f)
                     for _ in range(data_start_idx):
-                        next(f, None)
+                        next(cleaned_file, None)
                         
-                    reader = csv.reader(f, quoting=csv.QUOTE_NONE)
+                    reader = csv.reader(cleaned_file, quoting=csv.QUOTE_NONE)
                     try:
                         headers = next(reader)
                     except StopIteration:
