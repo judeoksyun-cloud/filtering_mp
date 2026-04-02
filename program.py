@@ -8,7 +8,7 @@ import random
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox, 
-                             QProgressDialog, QDialog, QSpinBox, QLineEdit)
+                             QProgressDialog, QDialog, QSpinBox, QLineEdit, QInputDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPoint
 from PyQt5.QtGui import QKeySequence, QIcon
 
@@ -391,22 +391,12 @@ class DataFilterApp(QMainWindow):
         self.table.setColumnWidth(0, 250)
         main_layout.addWidget(self.table)
 
-        # 4. Input output directory and Run Button
-        run_layout = QHBoxLayout()
-        lbl_dir = QLabel("저장 폴더명 :")
-        self.output_dir_input = QLineEdit("Filtering")
-        self.output_dir_input.setFixedWidth(150)
-        
+        # 4. Run Button
         btn_run = QPushButton("필터링 적용 및 저장하기")
         btn_run.setStyleSheet("background-color: #0078d7; color: white; font-size: 14px; padding: 10px;")
         btn_run.clicked.connect(self.show_run_options)
         
-        run_layout.addWidget(lbl_dir)
-        run_layout.addWidget(self.output_dir_input)
-        run_layout.addStretch()
-        run_layout.addWidget(btn_run)
-        
-        main_layout.addLayout(run_layout)
+        main_layout.addWidget(btn_run)
 
     def show_run_options(self):
         if not self.raw_data_dict:
@@ -422,18 +412,18 @@ class DataFilterApp(QMainWindow):
         msg_box.addButton("취소", QMessageBox.RejectRole)
         
         msg_box.exec_()
-        
-        output_dir = self.output_dir_input.text().strip()
-        if not output_dir:
-            output_dir = "Filtering"
             
         if msg_box.clickedButton() == btn_all:
-            self.run_filtering(mode='all', output_dir=output_dir)
+            output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
+            if ok and output_dir.strip():
+                self.run_filtering(mode='all', output_dir=output_dir.strip())
         elif msg_box.clickedButton() == btn_random:
             dialog = SamplingDialog(self)
             if dialog.exec_():
                 sample_filters, sample_n = dialog.get_data()
-                self.run_filtering(mode='random', sample_n=sample_n, sample_filters=sample_filters, output_dir=output_dir)
+                output_dir, ok = QInputDialog.getText(self, '저장 폴더명 지정', '저장할 폴더명을 지정하세요.\n(원본 폴더 하위에 생성됩니다.)', QLineEdit.Normal, 'Filtering')
+                if ok and output_dir.strip():
+                    self.run_filtering(mode='random', sample_n=sample_n, sample_filters=sample_filters, output_dir=output_dir.strip())
 
     def keyPressEvent(self, event):
         if event.matches(QKeySequence.Paste) and self.table.hasFocus():
